@@ -1,6 +1,4 @@
 _DATA SEGMENT
-steam_block_list_ptr        dq  141c7d010h
-is_user_blocked_func        dq  14050fbb0h
 
 _DATA ENDS
 
@@ -68,27 +66,37 @@ jmp     Send_Type17_GeneralRequestTask_injection_return
 Send_Type17_GeneralRequestTask_injection ENDP
 
 
-EXTERN BreakInTargetList_BlockCheck_injection_helper: PROC
-EXTERN BreakInTargetList_BlockCheck_injection_return: qword
+EXTERN BreakInPushDispatch_injection_helper: PROC
+EXTERN BreakInPushDispatch_injection_return: qword
 
-PUBLIC BreakInTargetList_BlockCheck_injection
-BreakInTargetList_BlockCheck_injection PROC
+PUBLIC BreakInPushDispatch_injection
+BreakInPushDispatch_injection PROC
 
-;original code
-mov     rcx, qword ptr [steam_block_list_ptr]
-mov     rcx, qword ptr [rcx]
-call    qword ptr [is_user_blocked_func]
-test    al, al
-jnz     skip_target
-mov     rcx, r15 ;steam id string. load before the prologue, which uses r15
 FUNC_PROLOGUE
-call    BreakInTargetList_BlockCheck_injection_helper
+call    BreakInPushDispatch_injection_helper
 mov     [rsp + 58h], rax ;return the result through the saved rax
 FUNC_EPILOGUE
-skip_target:
 test    al, al
-jmp     BreakInTargetList_BlockCheck_injection_return
-BreakInTargetList_BlockCheck_injection ENDP
+jz      BreakInPushDispatch_original
+;the push is being held, return without dispatching it
+ret
+BreakInPushDispatch_injection ENDP
+
+
+;Call the dispatcher without going through the injection
+PUBLIC BreakInPushDispatch_original
+BreakInPushDispatch_original PROC
+
+;original code
+push    rbp
+push    rsi
+push    rdi
+push    r14
+push    r15
+lea     rbp, [rsp-37h]
+sub     rsp, 0A0h
+jmp     BreakInPushDispatch_injection_return
+BreakInPushDispatch_original ENDP
 
 
 _TEXT    ENDS

@@ -3,24 +3,23 @@
 #include "SP/memory/injection/asm/x64.h"
 #include "MainLoop.h"
 #include "ModNetworking.h"
-#include "GameEnum.h"
 #include <tuple>
 #include <vector>
 #include <string>
 #include <atomic>
 #include <mutex>
-#include <unordered_set>
+#include <optional>
 
 extern "C" {
     uint64_t Send_Type17_GeneralRequestTask_injection_return;
     void Send_Type17_GeneralRequestTask_injection();
     void Send_Type17_GeneralRequestTask_injection_helper(uint64_t RequestGetBreakInTargetList_Data);
-    uint64_t BreakInTargetList_BlockCheck_injection_return;
-    void BreakInTargetList_BlockCheck_injection();
-    bool BreakInTargetList_BlockCheck_injection_helper(void* steamid_str);
+    uint64_t BreakInPushDispatch_injection_return;
+    void BreakInPushDispatch_injection();
+    void BreakInPushDispatch_original(void* breakin_impl, uint32_t type, uint8_t* data, uint64_t size);
+    bool BreakInPushDispatch_injection_helper(void* breakin_impl, uint32_t type, uint8_t* data, uint64_t size);
 }
-static bool PublishCoopPhantomCount(void* unused);
-static void RequestJollyHostList();
+static bool CheckHeldBreakInAllow(void* unused);
 
 void CustomInvasionTypes::start()
 {
@@ -28,10 +27,10 @@ void CustomInvasionTypes::start()
 
     uint8_t *write_address = (uint8_t*)(CustomInvasionTypes::Send_Type17_GeneralRequestTask_offset + Game::ds1_base);
     sp::mem::code::x64::inject_jmp_14b(write_address, &Send_Type17_GeneralRequestTask_injection_return, 2, &Send_Type17_GeneralRequestTask_injection);
-    //Filter the break in target list for the Jolly eye orb
-    write_address = (uint8_t*)(CustomInvasionTypes::BreakInTargetList_BlockCheck_offset + Game::ds1_base);
-    sp::mem::code::x64::inject_jmp_14b(write_address, &BreakInTargetList_BlockCheck_injection_return, 0, &BreakInTargetList_BlockCheck_injection);
-    MainLoop::setup_mainloop_callback(PublishCoopPhantomCount, NULL, "PublishCoopPhantomCount");
+    //Hold the host's break in allow for the Jolly eye orb until we know their lobby size
+    write_address = (uint8_t*)(CustomInvasionTypes::BreakInPushDispatch_offset + Game::ds1_base);
+    sp::mem::code::x64::inject_jmp_14b(write_address, &BreakInPushDispatch_injection_return, 6, &BreakInPushDispatch_injection);
+    MainLoop::setup_mainloop_callback(CheckHeldBreakInAllow, NULL, "CheckHeldBreakInAllow");
 }
 
 //These only need to include 1 area id from each set that match all but the last digit
@@ -155,7 +154,6 @@ void Send_Type17_GeneralRequestTask_injection_helper(uint64_t RequestGetBreakInT
             if (current_InvasionOrb == InvasionOrb::AllAreasJolly)
             {
                 last_jolly_search_time = GetTickCount64();
-                RequestJollyHostList();
                 swprintf(banner_msg, sizeof(banner_msg) / sizeof(wchar_t), L"Searching area for co-op: %s", std::get<1>(MultiPlayerRegionIDs[current_mpregionid_offset]).c_str());
                 ConsoleWrite("Jolly orb: area %d", std::get<0>(MultiPlayerRegionIDs[current_mpregionid_offset]));
             }
@@ -286,16 +284,21 @@ void Send_Type17_GeneralRequestTask_injection_helper(uint64_t RequestGetBreakInT
 
 /*
  * ===========JOLLY EYE ORB SECTION
- * Hosts publish their phantom counts in their persistent lobby data. Invaders use the lobby list to find
- * hosts with a coop phantom and no hostile phantoms, and skip all other break in targets.
+ * When a host allows our break in, their lobby id is sent to us before the game starts joining.
+ * Hold that message, and only pass it on to the game if the host's lobby has another player in it.
  */
-static const char* MOD_LOBBY_COOPCOUNT_KEY = "DarkSoulsOverhaulCoopPhantoms";
-static const char* MOD_LOBBY_HOSTILECOUNT_KEY = "DarkSoulsOverhaulHostilePhantoms";
-static const char* MOD_LOBBY_HOSTID_KEY = "DarkSoulsOverhaulHostId";
-
 //If no search request has been sent in this time, the search has ended
 static const uint64_t JOLLY_SEARCH_TIMEOUT_MS = 60000;
-static const uint64_t JOLLY_HOSTLIST_REFRESH_MS = 5000;
+static const uint64_t JOLLY_LOBBY_DATA_TIMEOUT_MS = 3000;
+
+static const uint32_t PushRequestAllowBreakInTarget_Red = 5;
+static const uint32_t PushRequestAllowBreakInTarget_Blue = 9;
+
+typedef void* FlatbufferGetRoot_FUNC(uint8_t* data, uint64_t size);
+static FlatbufferGetRoot_FUNC* BreakInPush_GetRoot = (FlatbufferGetRoot_FUNC*)0x14112fe00;
+typedef void* FlatbufferGetField_FUNC(void* table);
+static FlatbufferGetField_FUNC* BreakInPush_GetBody = (FlatbufferGetField_FUNC*)0x140bd27e0;
+static FlatbufferGetField_FUNC* AllowBreakIn_GetJoinData = (FlatbufferGetField_FUNC*)0x140bd2aa0;
 
 bool CustomInvasionTypes::jolly_search_active()
 {
@@ -303,144 +306,101 @@ bool CustomInvasionTypes::jolly_search_active()
     return current_InvasionOrb == InvasionOrb::AllAreasJolly && last_time != 0 && GetTickCount64() - last_time < JOLLY_SEARCH_TIMEOUT_MS;
 }
 
-static std::mutex JollyHosts_Mtx;
-static std::unordered_set<uint64_t> JollyHosts;
-static std::atomic<uint64_t> last_hostlist_request_time = 0;
-
-class JollyHostListRequest
+struct HeldBreakInAllow
 {
-public:
-    CCallResult<JollyHostListRequest, LobbyMatchList_t> CallResult;
-    void LobbyMatchListCallback(LobbyMatchList_t* pCallback, bool bIOFailure);
+    void* breakin_impl;
+    uint32_t type;
+    std::vector<uint8_t> data;
+    uint64_t lobby;
+    uint64_t time;
 };
-static JollyHostListRequest jollyHostListRequest;
+static std::mutex HeldBreakInAllow_Mtx;
+static std::optional<HeldBreakInAllow> held_allow;
 
-static void RequestJollyHostList()
+//The join data is a serialized blob. Find the steam lobby id in it by its universe/type/instance bits.
+static uint64_t FindLobbyIdInJoinData(uint8_t* join_data, uint32_t len)
 {
-    if (ModNetworking::SteamMatchmaking == nullptr || jollyHostListRequest.CallResult.IsActive())
+    for (uint32_t i = 0; i + sizeof(uint64_t) <= len; i++)
     {
-        return;
-    }
-    uint64_t now = GetTickCount64();
-    if (now - last_hostlist_request_time.load() < JOLLY_HOSTLIST_REFRESH_MS)
-    {
-        return;
-    }
-    last_hostlist_request_time = now;
-
-    //filters are cleared after every request
-    ModNetworking::SteamMatchmaking->AddRequestLobbyListNumericalFilter(MOD_LOBBY_COOPCOUNT_KEY, 1, k_ELobbyComparisonEqualToOrGreaterThan);
-    ModNetworking::SteamMatchmaking->AddRequestLobbyListNumericalFilter(MOD_LOBBY_HOSTILECOUNT_KEY, 0, k_ELobbyComparisonEqual);
-    ModNetworking::SteamMatchmaking->AddRequestLobbyListDistanceFilter(k_ELobbyDistanceFilterWorldwide);
-    ModNetworking::SteamMatchmaking->AddRequestLobbyListResultCountFilter(250);
-    SteamAPICall_t call = ModNetworking::SteamMatchmaking->RequestLobbyList();
-    jollyHostListRequest.CallResult.Set(call, &jollyHostListRequest, &JollyHostListRequest::LobbyMatchListCallback);
-}
-
-void JollyHostListRequest::LobbyMatchListCallback(LobbyMatchList_t* pCallback, bool bIOFailure)
-{
-    if (bIOFailure)
-    {
-        return;
-    }
-    std::unordered_set<uint64_t> hosts;
-    for (uint32_t i = 0; i < pCallback->m_nLobbiesMatching; i++)
-    {
-        CSteamID lobby = ModNetworking::SteamMatchmaking->GetLobbyByIndex(i);
-        const char* host_str = ModNetworking::SteamMatchmaking->GetLobbyData(lobby, MOD_LOBBY_HOSTID_KEY);
-        uint64_t host = strtoull(host_str, NULL, 10);
-        if (host != 0 && host != ULLONG_MAX)
+        uint64_t val = *(uint64_t*)(join_data + i);
+        if ((val >> 48) == 0x0186)
         {
-            hosts.insert(host);
+            return val;
         }
     }
-    ConsoleWrite("Jolly orb: found %d hosts with only coop phantoms", hosts.size());
-    JollyHosts_Mtx.lock();
-    JollyHosts = std::move(hosts);
-    JollyHosts_Mtx.unlock();
+    return 0;
 }
 
-//Returns true if this break in target should be skipped
-bool BreakInTargetList_BlockCheck_injection_helper(void* steamid_str)
+//Returns true if this push should be held instead of dispatched
+bool BreakInPushDispatch_injection_helper(void* breakin_impl, uint32_t type, uint8_t* data, uint64_t size)
 {
-    if (!CustomInvasionTypes::jolly_search_active())
+    if (type != PushRequestAllowBreakInTarget_Red && type != PushRequestAllowBreakInTarget_Blue)
     {
         return false;
     }
-    //std::string: small strings are stored inline
-    const char* steamid_chars = (*(uint64_t*)((uint64_t)steamid_str + 0x18) >= 0x10) ? *(const char**)steamid_str : (const char*)steamid_str;
-    uint64_t steamid = strtoull(steamid_chars, NULL, 16);
-    JollyHosts_Mtx.lock();
-    bool has_coop = JollyHosts.contains(steamid);
-    JollyHosts_Mtx.unlock();
-    if (!has_coop)
+    if (!CustomInvasionTypes::jolly_search_active() || ModNetworking::SteamMatchmaking == nullptr)
     {
-        ConsoleWrite("Jolly orb: skipping target %llx", steamid);
+        return false;
     }
-    return !has_coop;
-}
 
-static uint64_t published_coop_lobby = 0;
-static int32_t published_coop_count = -1;
-static int32_t published_hostile_count = -1;
-
-//Publish the coop and hostile phantom counts in our world to our persistent lobby
-static bool PublishCoopPhantomCount(void* unused)
-{
-    if (ModNetworking::SteamMatchmaking == nullptr || ModNetworking::SteamUser == nullptr || is_seamless_coop_present())
+    uint64_t lobby = 0;
+    void* root = BreakInPush_GetRoot(data, size);
+    void* body = (root != nullptr) ? BreakInPush_GetBody(root) : nullptr;
+    uint8_t* join_data = (body != nullptr) ? (uint8_t*)AllowBreakIn_GetJoinData(body) : nullptr;
+    if (join_data != nullptr)
     {
-        return true;
+        uint32_t len = *(uint32_t*)join_data;
+        lobby = FindLobbyIdInJoinData(join_data + 4, len);
+        if (lobby == 0)
+        {
+            std::string hex;
+            char byte_str[4];
+            for (uint32_t i = 0; i < len && i < 64; i++)
+            {
+                snprintf(byte_str, sizeof(byte_str), "%02x ", join_data[4 + i]);
+                hex += byte_str;
+            }
+            ConsoleWrite("Jolly orb: no lobby id in join data (%d bytes): %s", len, hex.c_str());
+        }
     }
-    uint64_t lobby = ModNetworking::selfPersisantLobby.load();
+    //Never let the game join a host we can't check
     if (lobby == 0)
     {
         return true;
     }
-    //Anyone who isn't a coop phantom is treated as hostile
-    int32_t coop_count = 0;
-    int32_t hostile_count = 0;
-    auto playerins_o = Game::get_PlayerIns();
-    if (Game::playerchar_is_loaded() && playerins_o.has_value() && playerins_o.value() != NULL &&
-        Game::get_player_chr_type((uint64_t)playerins_o.value()) == PLAYER_STATUS::HUMAN)
-    {
-        for (uint32_t i = 1; i < 6; i++)
-        {
-            std::optional<uint64_t> guest_o = Game::get_connected_player(i);
-            if (!guest_o.has_value())
-            {
-                break;
-            }
-            if (guest_o.value() == 0)
-            {
-                continue;
-            }
-            if (Game::get_player_chr_type(guest_o.value()) == PLAYER_STATUS::COOP)
-            {
-                coop_count++;
-            }
-            else
-            {
-                hostile_count++;
-            }
-        }
-    }
 
-    //only write on change, since every write is sent to everyone in the lobby
-    if (lobby != published_coop_lobby || coop_count != published_coop_count || hostile_count != published_hostile_count)
+    ConsoleWrite("Jolly orb: host allowed break in, checking lobby %llx", lobby);
+    ModNetworking::SteamMatchmaking->RequestLobbyData(lobby);
+    HeldBreakInAllow_Mtx.lock();
+    held_allow = HeldBreakInAllow{ breakin_impl, type, std::vector<uint8_t>(data, data + size), lobby, GetTickCount64() };
+    HeldBreakInAllow_Mtx.unlock();
+    return true;
+}
+
+//Once we know how many players are in the host's lobby, either pass the held allow to the game or drop it
+static bool CheckHeldBreakInAllow(void* unused)
+{
+    HeldBreakInAllow_Mtx.lock();
+    if (!held_allow.has_value())
     {
-        //Invaders can't see the lobby owner without joining, so publish our id
-        std::string hostid_str = std::to_string(ModNetworking::SteamUser->GetSteamID().ConvertToUint64());
-        std::string coop_str = std::to_string(coop_count);
-        std::string hostile_str = std::to_string(hostile_count);
-        if (ModNetworking::SteamMatchmaking->SetLobbyData(lobby, MOD_LOBBY_HOSTID_KEY, hostid_str.c_str()) &&
-            ModNetworking::SteamMatchmaking->SetLobbyData(lobby, MOD_LOBBY_COOPCOUNT_KEY, coop_str.c_str()) &&
-            ModNetworking::SteamMatchmaking->SetLobbyData(lobby, MOD_LOBBY_HOSTILECOUNT_KEY, hostile_str.c_str()))
-        {
-            ConsoleWrite("Set lobby coop phantom count = %d, hostile phantom count = %d", coop_count, hostile_count);
-            published_coop_lobby = lobby;
-            published_coop_count = coop_count;
-            published_hostile_count = hostile_count;
-        }
+        HeldBreakInAllow_Mtx.unlock();
+        return true;
+    }
+    //returns 0 until we have the lobby data
+    int members = ModNetworking::SteamMatchmaking->GetNumLobbyMembers(held_allow->lobby);
+    if (members == 0 && GetTickCount64() - held_allow->time < JOLLY_LOBBY_DATA_TIMEOUT_MS)
+    {
+        HeldBreakInAllow_Mtx.unlock();
+        return true;
+    }
+    HeldBreakInAllow allow = std::move(held_allow.value());
+    held_allow.reset();
+    HeldBreakInAllow_Mtx.unlock();
+
+    ConsoleWrite("Jolly orb: lobby %llx has %d members", allow.lobby, members);
+    if (members >= 2 && CustomInvasionTypes::jolly_search_active())
+    {
+        BreakInPushDispatch_original(allow.breakin_impl, allow.type, allow.data.data(), allow.data.size());
     }
     return true;
 }

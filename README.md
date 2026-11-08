@@ -98,7 +98,7 @@ Specify folder location + filenames to use, and the alternate path will be used 
   * "__Searching Blue Eye Orb__" (id 150, available from Rickert of Vinheim), a variant of the "Searching Red Eye Orb" used to look for for blue (Darkmoon Covenant) invasions across all areas.
   * "__Unbound Blue Eye Orb__" (id 151, available from Rickert of Vinheim), a variant of the "Unbound Red Eye Orb" used to look for blue (Darkmoon Covenant) invasions while searching infinitely upwards in Soul Level.
   * "__Twin Blue Eye Orb__" (id 152, available from Rickert of Vinheim), a variant of the "Unbound Red Eye Orb" that does both of the above orbs' functions, combined.
-  * "__Jolly Red Eye Orb__" (id 108, available from Rickert of Vinheim), a variant of the "Searching Red Eye Orb" that only invades hosts who have at least one cooperative phantom and no hostile (red, blue, etc) phantoms. Only works on hosts using the mod.
+  * "__Jolly Red Eye Orb__" (id 154, available from Rickert of Vinheim), a variant of the "Searching Red Eye Orb" that only invades hosts who have at least one other player in their world. The host's session is checked before joining, so hosts playing alone are skipped.
   * "__Jolly Blue Eye Orb__" (id 153, available from Rickert of Vinheim), a variant of the "Jolly Red Eye Orb" used to look for blue (Darkmoon Covenant) invasions.
 
 * System for selecting what areas you want to try invading with the above eye orbs.  

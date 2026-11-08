@@ -22,7 +22,7 @@ public:
     static const uint32_t AllAreasJollyInvadingOrbSpEffect_Blue = 95;
 private:
     static const uint64_t Send_Type17_GeneralRequestTask_offset = 0xbd1730;
-    static const uint64_t BreakInTargetList_BlockCheck_offset = 0xf0857;
+    static const uint64_t BreakInPushDispatch_offset = 0xbd0be0;
 };
 
 #endif
