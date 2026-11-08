@@ -1,4 +1,6 @@
 _DATA SEGMENT
+steam_block_list_ptr        dq  141c7d010h
+is_user_blocked_func        dq  14050fbb0h
 
 _DATA ENDS
 
@@ -64,6 +66,29 @@ lea     rbp, [rsp-47h]
 sub     rsp, 0D0h
 jmp     Send_Type17_GeneralRequestTask_injection_return
 Send_Type17_GeneralRequestTask_injection ENDP
+
+
+EXTERN BreakInTargetList_BlockCheck_injection_helper: PROC
+EXTERN BreakInTargetList_BlockCheck_injection_return: qword
+
+PUBLIC BreakInTargetList_BlockCheck_injection
+BreakInTargetList_BlockCheck_injection PROC
+
+;original code
+mov     rcx, qword ptr [steam_block_list_ptr]
+mov     rcx, qword ptr [rcx]
+call    qword ptr [is_user_blocked_func]
+test    al, al
+jnz     skip_target
+mov     rcx, r15 ;steam id string. load before the prologue, which uses r15
+FUNC_PROLOGUE
+call    BreakInTargetList_BlockCheck_injection_helper
+mov     [rsp + 58h], rax ;return the result through the saved rax
+FUNC_EPILOGUE
+skip_target:
+test    al, al
+jmp     BreakInTargetList_BlockCheck_injection_return
+BreakInTargetList_BlockCheck_injection ENDP
 
 
 _TEXT    ENDS
