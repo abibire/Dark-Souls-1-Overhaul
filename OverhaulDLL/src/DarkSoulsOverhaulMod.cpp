@@ -160,7 +160,7 @@ DWORD WINAPI on_process_attach_async(LPVOID lpParam)
     InvisBackstabFix::start();
     AnimationEdits::start();
     SpellDesync::start();
-    //PhantomUnshackle::start(); //TEMP: disabled to test boss area kicks
+    PhantomUnshackle::start();
     FixAnkles::start();
     ModNetworking::start();
     ServerMonitor::start();
